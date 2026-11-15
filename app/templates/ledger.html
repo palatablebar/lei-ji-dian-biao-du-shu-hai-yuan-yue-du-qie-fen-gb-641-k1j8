@@ -1,0 +1,306 @@
+{% extends "base.html" %}
+{% block body %}
+<section class="page-head">
+  <div>
+    <h1 class="page-title">正式账与更正</h1>
+    <p class="page-meta mono">
+      {% if ledger.version %}当前版本 v{{ ledger.version.version_no }} · {{ ledger.version.version_id }} · 基准批次 {{ ledger.version.base_batch_id }}{% else %}还没有已发布的正式账{% endif %}
+    </p>
+  </div>
+  <div class="actions">
+    <button class="btn btn-primary" id="publish-button" type="button">把当前批次发布为正式账</button>
+    {% if ledger.version %}
+    <a class="btn btn-ghost" href="/api/export/ledger/monthly.csv">月账 CSV</a>
+    <a class="btn btn-ghost" href="/api/export/ledger/adjustments.csv">调账 CSV</a>
+    <a class="btn btn-ghost" href="/api/export/ledger/reconcile.json">四账 JSON</a>
+    {% endif %}
+  </div>
+</section>
+
+<div class="notice" id="notice" role="status" hidden></div>
+
+{% if not ledger.version %}
+<section class="empty">
+  <p class="empty-line">还没有正式账。先在总览页跑一次处理，再点「把当前批次发布为正式账」完成关账。</p>
+</section>
+{% else %}
+
+{% if not ledger.is_current %}
+<section class="banner">
+  查看的是历史版本 v{{ ledger.version.version_no }}（{{ ledger.version.version_id }}），
+  当前生效版本是 v{{ ledger.current_version_no }}。<a class="link" href="/ledger">回到当前版本</a>
+</section>
+{% endif %}
+
+<section class="kpis" aria-label="版本信息">
+  <div class="kpi"><span class="kpi-label">版本</span><span class="kpi-value mono">v{{ ledger.version.version_no }}</span></div>
+  <div class="kpi"><span class="kpi-label">类型</span><span class="kpi-value">{{ ledger.version.kind|versionkind }}</span></div>
+  <div class="kpi"><span class="kpi-label">更正号</span><span class="kpi-value mono">{% if ledger.version.correction_id %}{{ ledger.version.correction_id }}{% else %}—{% endif %}</span></div>
+  <div class="kpi"><span class="kpi-label">内容摘要</span><span class="kpi-value mono">{{ ledger.version.digest[:12] }}</span></div>
+  <div class="kpi"><span class="kpi-label">发布时间</span><span class="kpi-value mono">{{ ledger.version.created_at|localdt }}</span></div>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2 class="panel-title">四账与调账账</h2>
+    <span class="badge badge-{{ 'ok' if ledger.reconcile.all_balanced else 'bad' }}">{% if ledger.reconcile.all_balanced %}平衡{% else %}不平{% endif %}</span>
+  </div>
+  <table class="table">
+    <thead><tr><th>账</th><th class="num">左</th><th class="num">右</th><th class="num">差额</th><th>说明</th></tr></thead>
+    <tbody>
+      {% for row in ledger.reconcile.accounts %}
+      <tr>
+        <td>{{ row.label }}</td>
+        <td class="num mono">{{ row.left|unitnum(row.unit) }}<span class="unit">{{ row.unit }}</span></td>
+        <td class="num mono">{{ row.right|unitnum(row.unit) }}<span class="unit">{{ row.unit }}</span></td>
+        <td class="num mono">{{ row.diff|unitnum(row.unit) }}<span class="unit">{{ row.unit }}</span></td>
+        <td class="cell-note">{{ row.note }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2 class="panel-title">正式月账</h2>
+    <span class="panel-sub mono">{{ ledger.bills|length }} 张 · 版本 {{ ledger.version.version_id }}</span>
+  </div>
+  <div class="table-wrap">
+    <table class="table table-dense" data-sortable>
+      <thead><tr><th data-key="month">月份</th><th data-key="meter_id">表号</th><th data-key="usage_kwh" class="num">用量</th>
+        <th data-key="amount_yuan" class="num">金额</th><th>类型</th><th>分项</th></tr></thead>
+      <tbody>
+        {% for bill in ledger.bills %}
+        <tr>
+          <td class="mono">{{ bill.month }}</td>
+          <td class="mono">{{ bill.meter_id }}</td>
+          <td class="num mono">{{ bill.usage_kwh|kwh }}</td>
+          <td class="num mono strong">{{ bill.amount_yuan|yuan }}</td>
+          <td><span class="badge badge-{{ 'warn' if bill.kind == 'adjusted' else 'plain' }}">{{ bill.kind|billkind }}</span></td>
+          <td class="cell-flags mono">
+            {% for line in bill.lines %}
+              {% if line.line_kind == 'adjustment' %}
+              <span class="chip chip-warn" title="更正 {{ line.correction_id }}">调 ←{{ line.origin_month }} {{ line.register }} {{ line.amount_yuan }}</span>
+              {% else %}
+              <span class="chip">{{ line.register }} {{ line.amount_yuan }}</span>
+              {% endif %}
+            {% endfor %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+
+{% if review %}
+<section class="panel">
+  <div class="panel-head">
+    <h2 class="panel-title">更正复核 · {{ review.correction.correction_id }}</h2>
+    <span class="badge badge-{{ 'ok' if review.status == 'applied' else ('warn' if review.status == 'noop' else 'bad') }}">{{ review.status|status }}</span>
+  </div>
+  <p class="page-meta">
+    {{ review.correction.created_at|localdt }} · 原因：{{ review.correction.reason }}
+    {% if review.correction.ticket %} · 工单 {{ review.correction.ticket }}{% endif %}
+    · 入账月 <span class="mono">{{ review.posted_month }}</span>
+    {% if review.version %} · 版本 <span class="mono">v{{ review.version.version_no }}</span>{% endif %}
+    {% if review.correction.note %} · {{ review.correction.note }}{% endif %}
+  </p>
+  <p class="page-meta">受影响表计：
+    {% for meter in review.affected_meters %}<span class="chip chip-info mono">{{ meter }}</span>{% else %}<span class="mono">无</span>{% endfor %}
+  </p>
+
+  <h3 class="panel-title">更正读数</h3>
+  <div class="table-wrap">
+    <table class="table table-dense">
+      <thead><tr><th>表号</th><th>寄存器</th><th>抄表时间</th><th class="num">原写</th><th class="num">折合</th><th>状态</th><th>取代</th></tr></thead>
+      <tbody>
+        {% for row in review.readings %}
+        <tr>
+          <td class="mono">{{ row.meter_id }}</td>
+          <td>{{ row.register|reg }}</td>
+          <td class="mono">{{ row.read_at|localdt }}</td>
+          <td class="num mono">{{ row.reading_text }}</td>
+          <td class="num mono">{% if row.reading_norm is not none %}{{ row.reading_norm|kwh }}{% else %}—{% endif %}</td>
+          <td>{% if row.code %}<span class="badge badge-bad">{{ row.code|code }}</span>{% else %}<span class="badge badge-ok">{{ row.status|status }}</span>{% endif %}</td>
+          <td class="mono">{% if row.supersedes %}<span class="chip chip-warn">{{ row.supersedes }}</span>{% else %}—{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if review.interval_changes %}
+  <h3 class="panel-title">区间变化与判定依据</h3>
+  <div class="table-wrap">
+    <table class="table table-dense">
+      <thead><tr><th>表号</th><th>寄存器</th><th>区间</th><th class="num">原用量</th><th class="num">新用量</th><th>依据</th></tr></thead>
+      <tbody>
+        {% for change in review.interval_changes %}
+        <tr>
+          <td class="mono">{{ change.meter_id }}</td>
+          <td>{{ change.register|reg }}</td>
+          <td class="mono">{{ change.start_at|localdt }} ~ {{ change.end_at|localdt }}</td>
+          <td class="num mono">{% if change.old %}{{ change.old.usage_kwh|kwh }}{% else %}—{% endif %}</td>
+          <td class="num mono">{% if change.new %}{{ change.new.usage_kwh|kwh }}{% else %}—{% endif %}</td>
+          <td class="cell-note">{% if change.new %}{{ change.new.basis }}{% else %}区间消失{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  {% if review.bill_changes %}
+  <h3 class="panel-title">账单变化（关账月不改账，差额进 {{ review.posted_month }}）</h3>
+  <div class="table-wrap">
+    <table class="table table-dense">
+      <thead><tr><th>起源月</th><th>表号</th><th class="num">已入账</th><th class="num">应算</th><th class="num">差额</th></tr></thead>
+      <tbody>
+        {% for change in review.bill_changes %}
+        <tr>
+          <td class="mono">{{ change.month }}</td>
+          <td class="mono">{{ change.meter_id }}</td>
+          <td class="num mono">{{ change.booked_amount|yuan }}</td>
+          <td class="num mono">{{ change.should_amount|yuan }}</td>
+          <td class="num mono strong">{{ change.delta_amount|yuan }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  {% if review.adjustments %}
+  <h3 class="panel-title">调账分项（入账 {{ review.posted_month }}）</h3>
+  <div class="table-wrap">
+    <table class="table table-dense">
+      <thead><tr><th>起源月</th><th>表号</th><th>寄存器</th><th class="num">用量差</th><th class="num">金额差</th></tr></thead>
+      <tbody>
+        {% for line in review.adjustments %}
+        <tr>
+          <td class="mono">{{ line.origin_month }}</td>
+          <td class="mono">{{ line.meter_id }}</td>
+          <td>{{ line.register|reg }}</td>
+          <td class="num mono">{{ line.usage_kwh|kwh }}</td>
+          <td class="num mono strong">{{ line.amount_yuan|yuan }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+{% endif %}
+
+{% if ledger.version %}
+<section class="panel">
+  <div class="panel-head">
+    <h2 class="panel-title">提交更正</h2>
+    <span class="panel-sub">补发的抄表更正进入开放账期，不改历史账</span>
+  </div>
+  <form id="correction-form">
+    <div class="form-grid">
+      <div class="form-field">
+        <label for="f-meter">表号</label>
+        <select id="f-meter" class="select">
+          {% for meter in contracts %}<option value="{{ meter.meter_id }}">{{ meter.meter_id }} · {{ meter.name }}</option>{% endfor %}
+        </select>
+      </div>
+      <div class="form-field">
+        <label for="f-register">寄存器</label>
+        <select id="f-register" class="select">
+          {% for key, label in register_labels.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}
+        </select>
+      </div>
+      <div class="form-field">
+        <label for="f-readat">抄表时间（带偏移）</label>
+        <input id="f-readat" class="input mono" placeholder="2026-03-16T00:00:00+08:00" required>
+      </div>
+      <div class="form-field">
+        <label for="f-reading">更正读数</label>
+        <input id="f-reading" class="input mono" placeholder="2600.0" required>
+      </div>
+      <div class="form-field">
+        <label for="f-unit">单位</label>
+        <input id="f-unit" class="input mono" value="kWh">
+      </div>
+      <div class="form-field">
+        <label for="f-posted">入账月份（开放账期）</label>
+        <input id="f-posted" class="input mono" value="{{ default_posted }}" placeholder="{{ default_posted }}">
+      </div>
+      <div class="form-field form-wide">
+        <label for="f-reason">更正原因（必填，复核依据）</label>
+        <input id="f-reason" class="input" placeholder="抄表班补发：3 月 16 日抄错，按营销系统工单更正" required>
+      </div>
+      <div class="form-field">
+        <label for="f-ticket">工单号</label>
+        <input id="f-ticket" class="input mono" placeholder="可选">
+      </div>
+    </div>
+    <button class="btn btn-primary" id="correction-button" type="submit">提交更正</button>
+  </form>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2 class="panel-title">更正记录</h2>
+    <span class="panel-sub mono">{{ corrections|length }} 条</span>
+  </div>
+  {% if not corrections %}<p class="empty-line">还没有更正。</p>{% else %}
+  <div class="table-wrap">
+    <table class="table table-dense">
+      <thead><tr><th>更正号</th><th>时间</th><th>原因</th><th>入账月</th><th>状态</th><th>受影响表计</th><th class="num">调账金额</th><th>版本</th></tr></thead>
+      <tbody>
+        {% for item in corrections %}
+        <tr>
+          <td class="mono"><a class="link" href="/ledger?correction={{ item.correction_id }}">{{ item.correction_id }}</a></td>
+          <td class="mono">{{ item.created_at|localdt }}</td>
+          <td class="cell-note">{{ item.reason }}</td>
+          <td class="mono">{{ item.posted_month }}</td>
+          <td><span class="badge badge-{{ 'ok' if item.status == 'applied' else ('warn' if item.status == 'noop' else 'bad') }}">{{ item.status|status }}</span></td>
+          <td class="cell-flags mono">{% for meter in item.affected_meters %}<span class="chip">{{ meter }}</span>{% endfor %}</td>
+          <td class="num mono">{{ item.adjustment_amount|yuan }}</td>
+          <td class="mono">{% if item.result_version_id %}<a class="link" href="/ledger?version_id={{ item.result_version_id }}">{{ item.result_version_id }}</a>{% else %}—{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2 class="panel-title">版本历史</h2>
+    <span class="panel-sub mono">{{ versions|length }} 个版本</span>
+  </div>
+  <div class="table-wrap">
+    <table class="table table-dense">
+      <thead><tr><th>版本</th><th>类型</th><th>更正号</th><th>摘要</th><th>发布时间</th><th>说明</th></tr></thead>
+      <tbody>
+        {% for item in versions %}
+        <tr>
+          <td class="mono">
+            <a class="link" href="/ledger?version_id={{ item.version_id }}">v{{ item.version_no }}</a>
+            {% if item.is_current %}<span class="badge badge-ok">当前</span>{% endif %}
+          </td>
+          <td>{{ item.kind|versionkind }}</td>
+          <td class="mono">{% if item.correction_id %}{{ item.correction_id }}{% else %}—{% endif %}</td>
+          <td class="mono" title="{{ item.digest }}">{{ item.digest[:12] }}</td>
+          <td class="mono">{{ item.created_at|localdt }}</td>
+          <td class="cell-note">{{ item.note }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+{% endblock %}
+{% block scripts %}
+<script src="/static/ledger.js" type="module"></script>
+<script src="/static/table.js" type="module"></script>
+{% endblock %}

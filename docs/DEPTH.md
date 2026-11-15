@@ -1,6 +1,6 @@
 # 深度登记 meterback（累计电表读数还原与月度切分）
 
-- 规模：中型（7 个功能模块 / 6 个应用页 / 77 条测试）
+- 规模：中型（8 个功能模块 / 7 个应用页 / 100 条测试）
 - 核心规则：**区间还原 + 按日权重月度切分**。读数按 `(表号, 寄存器, UTC 时间)` 排序后逐对还原：区间用量 =（本次 − 上次）× 综合倍率，满量容量翻转时补容量，换表处拆成「旧表末段 + 新表首读起算」两段，估抄行不作锚点但给区间打标记；区间用量按覆盖天数切到自然月（`[月初, 下月初)` 半开），余数用最大余额法分到 0.001 kWh，同月「总表 = 峰 + 平 + 谷」的残差并入最大分量。
 - 使用者与工作流：临江供电所抄表班 4 人、辖区 8 只示例表（实际 320 只），月度线损与电费原先靠 Excel 手拉；现在一次处理得到「区间用量 + 月度分摊 + 电费」，每个数字都能追回原始行号与原因码。
 
@@ -15,6 +15,7 @@
 | M5 月度切分 | 重算分摊与账单，看每月合计与尾差 | POST /api/months/allocate、页面 /months | `app/modules/m5_months/allocate.py` `app/modules/m5_months/weights.py` `app/modules/m5_months/tou.py` | `tests/test_m5_months.py` |
 | M6 批次与对账 | 跑全流程、查批次历史、看四账、失败重试 | POST /api/runs、GET /api/batches、GET /api/reconcile、页面 / 与 /batches | `app/modules/m6_batches/service.py` `app/modules/m6_batches/compare.py` `app/modules/m6_batches/history.py` `app/modules/m6_batches/resume.py` | `tests/test_m6_batches.py` |
 | M7 导出 | 导出月度分摊、区间、隔离、读数证据、运行清单 | GET /api/export/monthly.csv、GET /api/export/manifest.json、页面 /export | `app/modules/m7_export/evidence.py` `app/modules/m7_export/csv_out.py` `app/modules/m7_export/manifest_out.py` | `tests/test_m7_export.py` |
+| M8 正式账与更正 | 关账发布、提交补发更正、看调账与版本历史 | POST /api/ledger/publish、POST /api/corrections、GET /api/ledger、页面 /ledger | `app/modules/m8_ledger/correct.py` `app/modules/m8_ledger/service.py` `app/modules/m8_ledger/evidence.py` | `tests/test_m8_ledger.py` |
 
 端到端：`tests/test_e2e.py`（脏样例 → 六页 200 → 四账 → 导出，含 4xx 失败输入与幂等重跑）。
 不变量：`tests/test_invariants.py`（区间账 = 月度账、幂等重跑行数不变、月桶划分、账单闭合、读数分区）。
@@ -38,6 +39,9 @@
 | TRAP-18 | 0 字节文件、只有表头、数据行全是空行 | 三种都返回「成功导入 0 行」，或直接除零 | 三个文件级原因码分开返回，不落半批数据 | `app/modules/m1_ingest/service.py` | `tests/test_m1_ingest.py::test_empty_states_return_distinct_codes` |
 | TRAP-23 | 区间止点与下一段起点都算一次 | 相邻区间重复计入一天，月度用量偏高 | 区间与月桶都声明左闭右开 `[起, 止)`，相邻段首尾相接 | `app/modules/m5_months/weights.py`、`app/modules/m4_intervals/restore.py` | `tests/test_m5_months.py::test_month_slices_are_half_open`、`tests/test_m4_intervals.py::test_intervals_are_half_open_and_contiguous` |
 | TRAP-24 | 各月/各分量各自四舍五入后合计不等 | 分完差 0.001~0.02，账永远差几分 | 最大余额法分月；分量残差并入最大分量；账单先合计再舍入，分项补差 | `app/modules/m5_months/weights.py`、`app/modules/m5_months/tou.py` | `tests/test_m5_months.py::test_largest_remainder_keeps_total_exact`、`tests/test_m5_months.py::test_tou_components_closed_to_total` |
+| TRAP-25 | 历史调账随版本结转，跨版本求和当调账基数 | 第二次更正把第一次的调账重复计入，差额翻倍 | 已入账基数只取**当前版本**的分项：结转件在最新版本里每条恰好一份 | `app/modules/m8_ledger/service.py` | `tests/test_m8_ledger.py::test_correction_of_correction_supersedes` |
+| TRAP-26 | 默认入账月随版本推进变化 | 同一更正算出不同 correction_id，重跑变成新更正、重复调账 | 更正身份用请求里的入账月原文（可空），不用解析后的默认值 | `app/modules/m8_ledger/service.py` | `tests/test_m8_ledger.py::test_same_correction_replay_adds_nothing` |
+| TRAP-27 | 更正行被质量隔离（如负数）却顶替了原读数 | 有效读数凭空消失，差额无中生有 | 被隔离的更正行不许顶替，原行回到有效集，逐轮重建直到稳定 | `app/modules/m8_ledger/service.py` | `tests/test_m8_ledger.py::test_quarantined_correction_row_keeps_base_reading` |
 
 ## 对账规则
 
@@ -45,6 +49,7 @@
 - 区间账：主寄存器（总表优先）区间用量合计 = 月度分摊用量合计（0.001 kWh，逐位相等）。
 - 月度账：同月同表「总表 = 峰 + 平 + 谷」，闭合后的残差必须为 0，闭合前的尾差条数单独计数。
 - 账单账：账单金额 = 分项金额之和（分项先截尾再补分），四账在 `/` 与 `/batches` 页、`/api/reconcile`、运行清单里同源显示。
+- 调账账（版本级第五账）：本版本调账分项合计 = 各关账月「应算 − 已入账」差额合计；已入账基数含此前各版已调差额，只在当前版本取一份。版本级五账在 `/ledger`、`/api/ledger`、`/api/export/ledger/reconcile.json` 同源显示。
 
 ## 反例与不变量
 
@@ -60,4 +65,6 @@
 - 时区按固定 +08:00 处理，不引入 DST；跨时区台区不支持。
 - 并行抄表同一时刻多条读数只按「取值是否一致」判定冲突，没有设备侧时钟偏移校正。
 - 页面只做展示与触发，没有登录与权限；批次历史最多展示 20 条。
+- 正式账是单血统：一个基准批次一条更正链；已有更正入账后换基准批次返回 `E_LEDGER_BOUND`（清库或新库才能另起血统）。更正的受理与发布是单进程串行，没有并发锁。
+- 调账只进金额不进用量：开放账期用量永远对齐原始读数，历史月用量差只以备忘形式挂在调账分项上，不出单独的「用量更正账」。
 - 大文件未做分块导入（样例 60 行；按 320 只表月均 700 行估算，单文件仍在内存可接受范围）。

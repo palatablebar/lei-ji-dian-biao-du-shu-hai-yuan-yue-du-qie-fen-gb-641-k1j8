@@ -24,6 +24,7 @@ NAV = (
     ("/months", "月度分摊", "months"),
     ("/batches", "批次对账", "batches"),
     ("/export", "导出", "export"),
+    ("/ledger", "正式账", "ledger"),
 )
 
 STATUS_LABELS = {
@@ -31,11 +32,15 @@ STATUS_LABELS = {
     "valid": "有效", "estimate": "估抄", "quarantine": "隔离",
     "normal": "常规", "rollover": "满量翻转", "replacement_first": "新表首读",
     "replacement_last": "换表末读", "ok": "就绪", "skipped": "跳过",
+    "applied": "已入账", "noop": "无变化", "published": "已发布",
 }
 METHOD_LABELS = {
     "normal": "常规", "rollover": "满量翻转",
     "replacement_first": "新表首读", "replacement_last": "换表末读",
 }
+BILL_KIND_LABELS = {"issued": "当期发行", "carried": "历史结转",
+                    "adjusted": "含调账"}
+VERSION_KIND_LABELS = {"genesis": "关账发布", "correction": "更正入账"}
 
 
 @dataclass
@@ -64,6 +69,8 @@ def setup(app) -> None:
     env.filters["method"] = lambda m: METHOD_LABELS.get(m, m or "—")
     env.filters["code"] = reasons.label
     env.filters["status"] = lambda s: STATUS_LABELS.get(s, s or "—")
+    env.filters["billkind"] = lambda k: BILL_KIND_LABELS.get(k, k or "—")
+    env.filters["versionkind"] = lambda k: VERSION_KIND_LABELS.get(k, k or "—")
     env.filters["dec"] = fmt_dec
     env.filters["unitnum"] = fmt_unit
     env.filters["days"] = fmt_days

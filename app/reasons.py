@@ -16,6 +16,14 @@ REASONS: dict[str, dict[str, str]] = {
     "E_SAMPLE_UNKNOWN": {"label": "样例不存在", "level": "error"},
     "E_CONTRACT_INVALID": {"label": "表计契约无效", "level": "error"},
     "E_BATCH_NOT_FOUND": {"label": "批次不存在", "level": "error"},
+    "E_LEDGER_NOT_PUBLISHED": {"label": "还没有已发布的正式账", "level": "error"},
+    "E_LEDGER_EMPTY": {"label": "批次没有账单不能发布", "level": "error"},
+    "E_LEDGER_BOUND": {"label": "正式账已绑定其他批次", "level": "error"},
+    "E_VERSION_NOT_FOUND": {"label": "账版本不存在", "level": "error"},
+    "E_POSTED_MONTH_CLOSED": {"label": "入账月份已关账", "level": "error"},
+    "E_CORRECTION_EMPTY": {"label": "更正行或原因不能为空", "level": "error"},
+    "E_CORRECTION_NOT_FOUND": {"label": "更正不存在", "level": "error"},
+    "E_RECONCILE_UNBALANCED": {"label": "更正后四账不平", "level": "error"},
     "Q_COLUMN_COUNT": {"label": "列数与表头不一致", "level": "error"},
     "Q_TRUNCATED_ROW": {"label": "末行被截断", "level": "error"},
     "Q_MISSING_READING": {"label": "读数为空值哨兵", "level": "error"},
@@ -42,6 +50,8 @@ REASONS: dict[str, dict[str, str]] = {
     "K_UNIT_ASSUMED": {"label": "单位按契约补齐", "level": "info"},
     "K_UNIT_CONVERTED": {"label": "单位已折算", "level": "info"},
     "K_DUPLICATE_IDENTICAL": {"label": "重复行已合并", "level": "info"},
+    "K_SUPERSEDED": {"label": "原读数被更正取代", "level": "info"},
+    "K_ADJUSTMENT_BOOKED": {"label": "差额已调入开放账期", "level": "info"},
 }
 
 

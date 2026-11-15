@@ -74,6 +74,60 @@ CREATE TABLE IF NOT EXISTS totals (
 CREATE TABLE IF NOT EXISTS manifests (
     batch_id TEXT PRIMARY KEY, json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS ledger_versions (
+    version_id TEXT PRIMARY KEY,
+    version_no INTEGER NOT NULL,
+    base_batch_id TEXT NOT NULL,
+    correction_id TEXT,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    posted_month TEXT,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_versions_base ON ledger_versions(base_batch_id, kind, status);
+CREATE TABLE IF NOT EXISTS ledger_pointer (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    version_id TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ledger_bills (
+    version_id TEXT NOT NULL, month TEXT NOT NULL, meter_id TEXT NOT NULL,
+    usage_kwh TEXT NOT NULL, amount_yuan TEXT NOT NULL,
+    kind TEXT NOT NULL, adjust_cents INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_bills_version ON ledger_bills(version_id);
+CREATE TABLE IF NOT EXISTS ledger_bill_lines (
+    version_id TEXT NOT NULL, month TEXT NOT NULL, meter_id TEXT NOT NULL,
+    line_kind TEXT NOT NULL, register TEXT NOT NULL,
+    usage_kwh TEXT NOT NULL, amount_yuan TEXT NOT NULL, price TEXT,
+    origin_month TEXT, correction_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_lines_version ON ledger_bill_lines(version_id);
+CREATE TABLE IF NOT EXISTS ledger_reconcile (
+    version_id TEXT PRIMARY KEY, json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS corrections (
+    correction_id TEXT PRIMARY KEY,
+    base_batch_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    ticket TEXT NOT NULL DEFAULT '',
+    posted_month TEXT NOT NULL,
+    status TEXT NOT NULL,
+    result_version_id TEXT,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_corrections_base ON corrections(base_batch_id, status);
+CREATE TABLE IF NOT EXISTS correction_readings (
+    correction_id TEXT NOT NULL, seq INTEGER NOT NULL,
+    meter_id TEXT NOT NULL, register TEXT NOT NULL, read_at TEXT NOT NULL,
+    reading_text TEXT NOT NULL, unit_raw TEXT NOT NULL, reading_norm TEXT,
+    unit_norm TEXT, read_type TEXT NOT NULL, status TEXT NOT NULL,
+    code TEXT, supersedes TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_correction_readings ON correction_readings(correction_id);
 """
 
 
@@ -347,6 +401,194 @@ class Store:
             return {t: conn.execute(
                 f"SELECT COUNT(*) AS n FROM {t} WHERE batch_id=?", (batch_id,)
             ).fetchone()["n"] for t in tables}
+
+    # ---------- 正式账版本 ----------
+    def next_version_no(self) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(version_no), 0) + 1 AS n FROM ledger_versions"
+            ).fetchone()
+        return int(row["n"])
+
+    def publish_version(self, *, version: dict, bills: list[dict], lines: list[dict],
+                        reconcile: dict, correction: dict | None = None,
+                        correction_readings: list[dict] | None = None) -> None:
+        """发布入账：版本、账单、分项、四账、指针在同一事务里落库。
+
+        中途任何一步失败整体回滚，指针不动，旧版本仍是当前版本；
+        更正记录随版本一起写，不会出现「有版本没更正」或「有更正没版本」。
+        """
+        with self.connect() as conn:
+            conn.execute(
+                """INSERT INTO ledger_versions (version_id,version_no,base_batch_id,
+                        correction_id,kind,status,digest,posted_month,note,created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (version["version_id"], version["version_no"], version["base_batch_id"],
+                 version.get("correction_id"), version["kind"], version["status"],
+                 version["digest"], version.get("posted_month"),
+                 version.get("note", ""), version["created_at"]))
+            for bill in bills:
+                conn.execute(
+                    """INSERT INTO ledger_bills (version_id,month,meter_id,usage_kwh,
+                            amount_yuan,kind,adjust_cents) VALUES (?,?,?,?,?,?,?)""",
+                    (version["version_id"], bill["month"], bill["meter_id"],
+                     str(bill["usage_kwh"]), str(bill["amount_yuan"]), bill["kind"],
+                     int(bill.get("adjust_cents", 0))))
+            for line in lines:
+                conn.execute(
+                    """INSERT INTO ledger_bill_lines (version_id,month,meter_id,line_kind,
+                            register,usage_kwh,amount_yuan,price,origin_month,correction_id)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (version["version_id"], line["month"], line["meter_id"],
+                     line["line_kind"], line["register"], str(line["usage_kwh"]),
+                     str(line["amount_yuan"]), line.get("price"),
+                     line.get("origin_month"), line.get("correction_id")))
+            conn.execute(
+                "INSERT INTO ledger_reconcile (version_id,json) VALUES (?,?)",
+                (version["version_id"], json.dumps(reconcile, ensure_ascii=False,
+                                                   default=str)))
+            conn.execute(
+                """INSERT INTO ledger_pointer (id,version_id) VALUES (1,?)
+                   ON CONFLICT(id) DO UPDATE SET version_id=excluded.version_id""",
+                (version["version_id"],))
+            if correction is not None:
+                self._upsert_correction(conn, correction, correction_readings or [])
+
+    def _upsert_correction(self, conn, correction: dict, readings: list[dict]) -> None:
+        conn.execute(
+            """INSERT INTO corrections (correction_id,base_batch_id,reason,ticket,
+                    posted_month,status,result_version_id,payload_json,note,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(correction_id) DO UPDATE SET
+                 status=excluded.status, result_version_id=excluded.result_version_id,
+                 payload_json=excluded.payload_json, note=excluded.note""",
+            (correction["correction_id"], correction["base_batch_id"],
+             correction["reason"], correction.get("ticket", ""),
+             correction["posted_month"], correction["status"],
+             correction.get("result_version_id"),
+             json.dumps(correction.get("payload", {}), ensure_ascii=False, default=str),
+             correction.get("note", ""), correction["created_at"]))
+        conn.execute("DELETE FROM correction_readings WHERE correction_id=?",
+                     (correction["correction_id"],))
+        for row in readings:
+            conn.execute(
+                """INSERT INTO correction_readings (correction_id,seq,meter_id,register,
+                        read_at,reading_text,unit_raw,reading_norm,unit_norm,read_type,
+                        status,code,supersedes,note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (correction["correction_id"], row["seq"], row["meter_id"],
+                 row["register"], row["read_at"], row["reading_text"],
+                 row.get("unit_raw", ""),
+                 None if row.get("reading_norm") is None else str(row["reading_norm"]),
+                 row.get("unit_norm"), row.get("read_type", "N"), row["status"],
+                 row.get("code"), row.get("supersedes", ""), row.get("note", "")))
+
+    def save_correction_attempt(self, correction: dict,
+                                readings: list[dict]) -> None:
+        """未入账的更正尝试（noop / 发布失败）：单独事务留痕，不动任何版本。"""
+        with self.connect() as conn:
+            self._upsert_correction(conn, correction, readings)
+
+    def current_version(self) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT v.* FROM ledger_versions v
+                   JOIN ledger_pointer p ON p.version_id = v.version_id
+                   WHERE p.id = 1""").fetchone()
+        return dict(row) if row else None
+
+    def get_version(self, version_id: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM ledger_versions WHERE version_id=?",
+                               (version_id,)).fetchone()
+        return dict(row) if row else None
+
+    def find_genesis(self, base_batch_id: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT * FROM ledger_versions WHERE base_batch_id=? AND kind='genesis'
+                   AND status='published' ORDER BY version_no LIMIT 1""",
+                (base_batch_id,)).fetchone()
+        return dict(row) if row else None
+
+    def lineage_has_corrections(self, base_batch_id: str) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) AS n FROM ledger_versions
+                   WHERE base_batch_id=? AND kind='correction' AND status='published'""",
+                (base_batch_id,)).fetchone()
+        return int(row["n"]) > 0
+
+    def list_versions(self, limit: int = 50) -> list[dict]:
+        return self._all(
+            "SELECT * FROM ledger_versions ORDER BY version_no DESC LIMIT ?",
+            (limit,))
+
+    def load_ledger_bills(self, version_id: str) -> list[dict]:
+        rows = self._all(
+            "SELECT * FROM ledger_bills WHERE version_id=? ORDER BY month, meter_id",
+            (version_id,))
+        for row in rows:
+            row["usage_kwh"] = _dec(row["usage_kwh"])
+            row["amount_yuan"] = _dec(row["amount_yuan"])
+        return rows
+
+    def load_ledger_lines(self, version_id: str) -> list[dict]:
+        rows = self._all(
+            "SELECT * FROM ledger_bill_lines WHERE version_id=? ORDER BY rowid",
+            (version_id,))
+        for row in rows:
+            row["usage_kwh"] = _dec(row["usage_kwh"])
+            row["amount_yuan"] = _dec(row["amount_yuan"])
+        return rows
+
+    def load_ledger_reconcile(self, version_id: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT json FROM ledger_reconcile WHERE version_id=?",
+                               (version_id,)).fetchone()
+        return json.loads(row["json"]) if row else None
+
+    # ---------- 更正 ----------
+    def get_correction(self, correction_id: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM corrections WHERE correction_id=?",
+                               (correction_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_corrections(self, base_batch_id: str | None = None) -> list[dict]:
+        sql = "SELECT * FROM corrections"
+        args: tuple = ()
+        if base_batch_id:
+            sql += " WHERE base_batch_id=?"
+            args = (base_batch_id,)
+        sql += " ORDER BY created_at DESC, correction_id DESC"
+        return self._all(sql, args)
+
+    def applied_correction_readings(self, base_batch_id: str) -> list[dict]:
+        """血统内已入账更正的有效读数行，按入账先后排序（后到者取代先到者）。"""
+        return self._all(
+            """SELECT r.* FROM correction_readings r
+               JOIN corrections c ON c.correction_id = r.correction_id
+               WHERE c.base_batch_id=? AND c.status='applied'
+                 AND r.status IN ('valid','estimate')
+               ORDER BY c.rowid, r.seq""",
+            (base_batch_id,))
+
+    def lineage_correction_row_count(self, base_batch_id: str) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) AS n FROM correction_readings r
+                   JOIN corrections c ON c.correction_id = r.correction_id
+                   WHERE c.base_batch_id=? AND c.status='applied'""",
+                (base_batch_id,)).fetchone()
+        return int(row["n"])
+
+    def count_ledger(self) -> dict:
+        with self.connect() as conn:
+            versions = conn.execute("SELECT COUNT(*) AS n FROM ledger_versions"
+                                    ).fetchone()["n"]
+            corrections = conn.execute("SELECT COUNT(*) AS n FROM corrections"
+                                       ).fetchone()["n"]
+        return {"versions": versions, "corrections": corrections}
 
     def _all(self, sql: str, args: tuple) -> list[dict]:
         with self.connect() as conn:

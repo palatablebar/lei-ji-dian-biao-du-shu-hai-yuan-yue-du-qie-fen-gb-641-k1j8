@@ -39,6 +39,32 @@ curl -sS -o /tmp/monthly.csv http://localhost:18200/api/export/monthly.csv
 - **重跑测试**：`docker compose exec -T app python -m pytest -q`。
 - **清库**：`docker compose down -v` 删除命名卷；下次启动自动建表。
 
+## 3.1 关账与补发更正
+
+1. **关账**：批次完成后，正式账页点「把当前批次发布为正式账」（或
+   `curl -X POST http://localhost:18200/api/ledger/publish`），得到创世版本 v1；
+   同一批次重复发布返回同一版本。
+2. **提交更正**：正式账页填表（表号、寄存器、抄表时间、更正读数、原因），或：
+
+   ```bash
+   curl -sS -X POST http://localhost:18200/api/corrections \
+     -H 'Content-Type: application/json' \
+     -d '{"items":[{"meter_id":"M0001","register":"TOTAL",
+                   "read_at":"2026-03-16T00:00:00+08:00","reading":"2600.0","unit":"kWh"}],
+         "reason":"抄表班补发：3月16日抄错","ticket":"GD-1001"}'
+   ```
+
+   响应给出：入账月（默认已发最大月份的下一月）、受影响表计、区间判定依据、
+   每个关账月的已入账 → 应算 → 差额、调账分项、版本级五账。
+3. **复核**：`/ledger` 页看当前版本正式月账（调账分项带 ←起源月 标记）、
+   更正复核、版本历史；`?version_id=` 可回看任何旧版本，导出跟随所选版本。
+4. **重跑同一更正**：原样再 POST 一次，命中同一 `correction_id`，
+   返回 `idempotent_replay: true`，不新增版本、不重复调账。
+5. **失败排查**：`E_LEDGER_NOT_PUBLISHED` 先发布正式账；`E_POSTED_MONTH_CLOSED`
+   换一个未关账的入账月；`E_RECONCILE_UNBALANCED` 看返回的差额账户，
+   当前正式账保持上一版本，修正后原样重试即可（failed 记录会被同号覆盖）。
+
+
 ## 4 失败排查
 
 | 现象 | 原因 | 处理 |
@@ -50,6 +76,10 @@ curl -sS -o /tmp/monthly.csv http://localhost:18200/api/export/monthly.csv
 | 422 `E_CONTRACT_INVALID` | `meters.csv` 重复表号、零倍率、换表目标缺失 | 修契约 |
 | 400 `E_SAMPLE_UNKNOWN` | 样例名不在白名单 | 用页面下拉框里的名字 |
 | 404 `E_BATCH_NOT_FOUND` | 还没有批次就导出 | 先跑一次处理 |
+| 409 `E_LEDGER_NOT_PUBLISHED` | 还没有正式账就提交更正 | 先发布正式账 |
+| 409 `E_LEDGER_BOUND` | 已有更正入账后换基准批次 | 更正只能跟随原血统 |
+| 409 `E_POSTED_MONTH_CLOSED` | 入账月已关账 | 用开放账期月份 |
+| 409 `E_RECONCILE_UNBALANCED` | 更正后四账不平 | 看差额账户，当前版本未动 |
 | 四账「不平」 | 逻辑或数据被改 | 看差额字段与说明，逐账核对 |
 
 日志：`docker compose logs -f app`（uvicorn 访问日志）。运行清单里的 `input_digest` 可用来确认两次运行读的是同一份输入。

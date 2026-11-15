@@ -77,8 +77,41 @@
 
 文件级 `E_*`：`E_EMPTY_FILE`、`E_HEADER_ONLY`、`E_ALL_BLANK`、`E_HEADER_INVALID`、`E_DECODE`、`E_SAMPLE_UNKNOWN`、`E_CONTRACT_INVALID`、`E_BATCH_NOT_FOUND`。
 
+正式账 `E_*`：`E_LEDGER_NOT_PUBLISHED`（未发布正式账就更正）、`E_LEDGER_BOUND`（已有更正入账后换基准批次）、`E_VERSION_NOT_FOUND`、`E_POSTED_MONTH_CLOSED`（入账月已关账）、`E_CORRECTION_EMPTY`（更正行或原因为空 / 全部无法解析）、`E_CORRECTION_NOT_FOUND`、`E_RECONCILE_UNBALANCED`（更正后四账不平，未入账）。
+
 行级 `Q_*`：`Q_COLUMN_COUNT`、`Q_TRUNCATED_ROW`、`Q_MISSING_READING`、`Q_BAD_READING`、`Q_BAD_TIME`、`Q_UNKNOWN_METER`、`Q_BAD_REGISTER`、`Q_BAD_UNIT`、`Q_BAD_READ_TYPE`、`Q_NEGATIVE_READING`、`Q_EXCEEDS_CAPACITY`、`Q_REVERSE_READING`、`Q_DUPLICATE_CONFLICT`、`Q_METER_RETIRED`。
 
-标记 `K_*`：`K_ROLLOVER`、`K_REPLACEMENT_FIRST`、`K_ESTIMATE_SKIPPED`、`K_CHARSET_FALLBACK`、`K_BOM_STRIPPED`、`K_SEGMENT_SPLIT`、`K_TRUNCATED_TAIL`、`K_TOU_ADJUSTED`、`K_BILL_ROUNDED`、`K_UNIT_ASSUMED`、`K_UNIT_CONVERTED`、`K_DUPLICATE_IDENTICAL`。
+标记 `K_*`：`K_ROLLOVER`、`K_REPLACEMENT_FIRST`、`K_ESTIMATE_SKIPPED`、`K_CHARSET_FALLBACK`、`K_BOM_STRIPPED`、`K_SEGMENT_SPLIT`、`K_TRUNCATED_TAIL`、`K_TOU_ADJUSTED`、`K_BILL_ROUNDED`、`K_UNIT_ASSUMED`、`K_UNIT_CONVERTED`、`K_DUPLICATE_IDENTICAL`、`K_SUPERSEDED`、`K_ADJUSTMENT_BOOKED`。
 
 唯一来源：`app/reasons.py`；页面与导出的原因文案都从它取。
+
+## 10 正式账与更正（M8）
+
+### 入账规则
+
+1. **关账发布**：`POST /api/ledger/publish` 把完成批次的账单与四账复制为正式账创世版本（`kind=genesis`）；同批次重复发布幂等。血统内已有更正入账后不得更换基准批次（`E_LEDGER_BOUND`）。
+2. **更正身份**：`correction_id` = 基准批次 + 请求入账月（原文，可空）+ 原因 + 工单 + 更正行原文的内容摘要。同一 payload 永远命中同一个号，重跑幂等；默认入账月随版本推进不会让同一更正变成新更正。
+3. **差额进开放账期**：已入账月（≤ 已发最大月份）的账单一行不改；更正重算的「应算 − 已入账」差额按寄存器拆成调账分项（`line_kind=adjustment`），记到 `posted_month`（默认已发最大月份 +1；指定时必须未关账）。已入账基数 = 当前版本的用量分项 + 当前版本全部调账分项（按起源月归集），第二次更正不会冲掉第一次的调账。
+4. **调账不进用量**：调账分项的用量差只作证据备忘，不计入入账月用量；入账月用量仍由原始读数算出。
+5. **noop**：版本内容摘要（账单 + 分项数值）与当前版本一致时不产生新版本，更正记 `status=noop`（如更正值与原值相同、更正行全部被隔离）。
+6. **被隔离的更正行不顶替原行**：更正行若被质量规则隔离，被它取代的原读数自动回到有效集，逐轮重建直到稳定。
+7. **取代链**：同业务键后到更正取代先到行（`supersedes` 记「批次行 N」或「cor-xxx#n」），原行全部留库，读数账单设「被取代」桶保持平衡。
+
+### 版本级五账
+
+读数账（含「被取代」桶）、区间账、月度账、账单账同批次口径；新增**调账账**：本版本调账分项合计 = 各关账月「应算 − 已入账」差额合计，两边逐分相等才允许发布。
+
+### 新表
+
+| 表 | 关键列 | 说明 |
+|---|---|---|
+| `ledger_versions` | `version_id` `version_no` `base_batch_id` `correction_id` `kind` `digest` `posted_month` | 账版本；`kind` = genesis / correction |
+| `ledger_pointer` | `version_id` | 单行当前指针，只在发布事务里翻转 |
+| `ledger_bills` | `version_id` `month` `meter_id` `usage_kwh` `amount_yuan` `kind` | 正式月账；`kind` = issued / carried / adjusted |
+| `ledger_bill_lines` | `version_id` `line_kind` `register` `usage_kwh` `amount_yuan` `origin_month` `correction_id` | 分项：usage / adjustment |
+| `ledger_reconcile` | `version_id` `json` | 版本级五账 |
+| `corrections` | `correction_id` `base_batch_id` `reason` `posted_month` `status` `result_version_id` `payload_json` | 更正单；status = applied / noop / failed |
+| `correction_readings` | `correction_id` `seq` `reading_text` `reading_norm` `status` `supersedes` | 更正读数行，追加存放不删改 |
+
+发布事务 = 版本行 + 账单 + 分项 + 五账 + 指针 + 更正单，同一事务落库；任何一步失败整体回滚，当前版本不动，失败尝试以 `status=failed` 单独留痕，可原样重试。
+
